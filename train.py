@@ -18,6 +18,7 @@ from fairseq import checkpoint_utils, distributed_utils, options, progress_bar, 
 from fairseq.data import iterators
 from fairseq.trainer import Trainer
 from fairseq.meters import AverageMeter, StopwatchMeter
+import time
 
 fb_pathmgr_registerd = False
 
@@ -201,6 +202,8 @@ def get_training_stats(trainer):
         stats['loss_scale'] = trainer.get_meter('loss_scale')
     stats['wall'] = round(trainer.get_meter('wall').elapsed_time)
     stats['train_wall'] = trainer.get_meter('train_wall')
+    cur_time = time.strftime("%a %b %d %H:%M:%S %Y", time.localtime())
+    stats['time'] = cur_time
     return stats
 
 
