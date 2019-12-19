@@ -17,6 +17,7 @@ from .fairseq_model import (
     FairseqLanguageModel,
     FairseqModel,
     FairseqMultiModel,
+    AudioEncoderDecoderModel,
 )
 
 from .composite_encoder import CompositeEncoder
@@ -41,6 +42,7 @@ __all__ = [
     'FairseqLanguageModel',
     'FairseqModel',
     'FairseqMultiModel',
+    'AudioEncoderDecoderModel',
 ]
 
 

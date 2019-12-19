@@ -183,6 +183,8 @@ def load_model_ensemble_and_task(filenames, arg_overrides=None, task=None):
 
         # build model for ensemble
         model = task.build_model(args)
+        # print(model)
+        # exit()
         model.load_state_dict(state['model'], strict=True, args=args)
         ensemble.append(model)
     return ensemble, args, task

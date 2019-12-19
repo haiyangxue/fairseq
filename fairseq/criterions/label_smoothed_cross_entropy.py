@@ -8,7 +8,7 @@ import math
 from fairseq import utils
 
 from . import FairseqCriterion, register_criterion
-
+import numpy
 
 def label_smoothed_nll_loss(lprobs, target, epsilon, ignore_index=None, reduce=True):
     if target.dim() == lprobs.dim() - 1:
@@ -53,7 +53,24 @@ class LabelSmoothedCrossEntropyCriterion(FairseqCriterion):
         2) the sample size, which is used as the denominator for the gradient
         3) logging outputs to display while training
         """
+        # print(sample['net_input'].keys())
+        # exit()
+        # print(model.decoder.tgt_dic)
+        # exit()
         net_output = model(**sample['net_input'])
+        print_ = numpy.random.randint(1, 10)
+
+            # print(model.get_targets(sample, net_output))
+        lprobs = model.get_normalized_probs(net_output, log_probs=True)
+        # if print_==1:
+        #     for item1,item2 in zip(model.decoder.tgt_dic.string(model.get_targets(sample, net_output)).split("\n"),model.decoder.tgt_dic.string(lprobs.argmax(-1)).split("\n")):
+        #         print()
+        #         print("target--- "+item1)
+        #         print("predict--- "+item2)
+
+            # print(model.decoder.tgt_dic.string(model.get_targets(sample, net_output)))
+            # print(model.decoder.tgt_dic.string(lprobs.argmax(-1)))
+        # exit()
         loss, nll_loss = self.compute_loss(model, net_output, sample, reduce=reduce)
         sample_size = sample['target'].size(0) if self.args.sentence_avg else sample['ntokens']
         logging_output = {
@@ -69,6 +86,7 @@ class LabelSmoothedCrossEntropyCriterion(FairseqCriterion):
         lprobs = model.get_normalized_probs(net_output, log_probs=True)
         lprobs = lprobs.view(-1, lprobs.size(-1))
         target = model.get_targets(sample, net_output).view(-1, 1)
+
         loss, nll_loss = label_smoothed_nll_loss(
             lprobs, target, self.eps, ignore_index=self.padding_idx, reduce=reduce,
         )

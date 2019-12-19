@@ -8,6 +8,7 @@ import os
 
 from fairseq import registry
 from fairseq.optim.fairseq_optimizer import FairseqOptimizer
+from fairseq.optim.optimizer import Optimizer
 from fairseq.optim.fp16_optimizer import FP16Optimizer, MemoryEfficientFP16Optimizer
 from fairseq.optim.bmuf import FairseqBMUF  # noqa
 
@@ -16,6 +17,7 @@ __all__ = [
     'FairseqOptimizer',
     'FP16Optimizer',
     'MemoryEfficientFP16Optimizer',
+    'Optimizer',
 ]
 
 

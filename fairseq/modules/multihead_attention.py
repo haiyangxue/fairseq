@@ -119,8 +119,12 @@ class MultiheadAttention(nn.Module):
         tgt_len, bsz, embed_dim = query.size()
         assert embed_dim == self.embed_dim
         assert list(query.size()) == [tgt_len, bsz, embed_dim]
-
+        # print(incremental_state)
         if self.enable_torch_version and not self.onnx_trace and incremental_state is None and not static_kv:
+            # if key_padding_mask is not None:
+            #     print(key_padding_mask.size())
+            # print("*********")
+            # print(key.size())
             return F.multi_head_attention_forward(query, key, value,
                                                   self.embed_dim, self.num_heads,
                                                   torch.empty([0]),
@@ -213,8 +217,11 @@ class MultiheadAttention(nn.Module):
         # not supporting Optional types.
         if key_padding_mask is not None and key_padding_mask.shape == torch.Size([]):
             key_padding_mask = None
-
+        # print(key_padding_mask)
         if key_padding_mask is not None:
+            # print( key_padding_mask.size())
+            # print(bsz)
+            # print(src_len)
             assert key_padding_mask.size(0) == bsz
             assert key_padding_mask.size(1) == src_len
 

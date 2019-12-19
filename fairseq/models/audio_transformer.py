@@ -8,12 +8,16 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from collections.abc import Iterable
 
 from fairseq import options, utils
+import argparse
+
 from fairseq.models import (
     FairseqEncoder,
     FairseqIncrementalDecoder,
     FairseqEncoderDecoderModel,
+    AudioEncoderDecoderModel,
     register_model,
     register_model_architecture,
 )
@@ -24,15 +28,19 @@ from fairseq.modules import (
     SinusoidalPositionalEmbedding,
     TransformerDecoderLayer,
     TransformerEncoderLayer,
+    TransformerAudioDecoderLayer,
+    VGGBlock,
 )
 import random
+from ..data.data_utils import lengths_to_encoder_padding_mask
+
 
 DEFAULT_MAX_SOURCE_POSITIONS = 1024
 DEFAULT_MAX_TARGET_POSITIONS = 1024
 
 
-@register_model('transformer')
-class TransformerModel(FairseqEncoderDecoderModel):
+@register_model('audio_transformer')
+class AudioTransformerModel(AudioEncoderDecoderModel):
     """
     Transformer model from `"Attention Is All You Need" (Vaswani, et al, 2017)
     <https://arxiv.org/abs/1706.03762>`_.
@@ -67,8 +75,8 @@ class TransformerModel(FairseqEncoderDecoderModel):
         }
         # fmt: on
 
-    def __init__(self, encoder, decoder):
-        super().__init__(encoder, decoder)
+    def __init__(self, encoder,audio_encoder, decoder):
+        super().__init__(encoder,audio_encoder, decoder)
         self.supports_align_args = True
 
     @staticmethod
@@ -194,13 +202,28 @@ class TransformerModel(FairseqEncoderDecoderModel):
             )
 
         encoder = cls.build_encoder(args, src_dict, encoder_embed_tokens)
+
         decoder = cls.build_decoder(args, tgt_dict, decoder_embed_tokens)
-        return cls(encoder, decoder)
+        audio_encoder = cls.build_audio_encoder(args)
+
+        # encoder=None
+        # return cls(encoder, decoder)
+        #
+        return cls(encoder,audio_encoder, decoder)
 
     @classmethod
     def build_encoder(cls, args, src_dict, embed_tokens):
         return TransformerEncoder(args, src_dict, embed_tokens)
 
+    @classmethod
+    def build_audio_encoder(cls, args):
+        return VGGTransformerEncoder(
+            input_feat_per_channel=args.input_feat_per_channel,
+            vggblock_config=eval(args.vggblock_enc_config),
+            transformer_config=eval(args.transformer_enc_config),
+            encoder_output_dim=args.enc_output_dim,
+            in_channels=args.in_channels,
+        )
     @classmethod
     def build_decoder(cls, args, tgt_dict, embed_tokens):
         return TransformerDecoder(
@@ -210,69 +233,21 @@ class TransformerModel(FairseqEncoderDecoderModel):
             no_encoder_attn=getattr(args, 'no_cross_attention', False),
         )
 
+def prepare_transformer_encoder_params(input_dim, num_heads,ffn_dim,normalize_before,dropout,attention_dropout,relu_dropout,
+):
+    args = argparse.Namespace()
+    args.encoder_embed_dim = input_dim
+    args.encoder_attention_heads = num_heads
+    # args.attention_dropout = attention_dropout
+    # args.dropout = dropout
+    # args.activation_dropout = relu_dropout
+    args.attention_dropout = 0
+    args.dropout = 0
+    args.activation_dropout = 0
+    args.encoder_normalize_before = normalize_before
+    args.encoder_ffn_embed_dim = ffn_dim
 
-@register_model('transformer_align')
-class TransformerAlignModel(TransformerModel):
-    """
-    See "Jointly Learning to Align and Translate with Transformer
-    Models" (Garg et al., EMNLP 2019).
-    """
-
-    def __init__(self, encoder, decoder, args):
-        super().__init__(encoder, decoder)
-        self.alignment_heads = args.alignment_heads
-        self.alignment_layer = args.alignment_layer
-        self.full_context_alignment = args.full_context_alignment
-
-    @staticmethod
-    def add_args(parser):
-        # fmt: off
-        super(TransformerAlignModel, TransformerAlignModel).add_args(parser)
-        parser.add_argument('--alignment-heads', type=int, metavar='D',
-                            help='Number of cross attention heads per layer to supervised with alignments')
-        parser.add_argument('--alignment-layer', type=int, metavar='D',
-                            help='Layer number which has to be supervised. 0 corresponding to the bottommost layer.')
-        parser.add_argument('--full-context-alignment', type=bool, metavar='D',
-                            help='Whether or not alignment is supervised conditioned on the full target context.')
-        # fmt: on
-
-    @classmethod
-    def build_model(cls, args, task):
-        # set any default arguments
-        transformer_align(args)
-
-        transformer_model = TransformerModel.build_model(args, task)
-        return TransformerAlignModel(transformer_model.encoder, transformer_model.decoder, args)
-
-    def forward(self, src_tokens, src_lengths, prev_output_tokens):
-        encoder_out = self.encoder(src_tokens, src_lengths)
-        return self.forward_decoder(prev_output_tokens, encoder_out)
-
-    def forward_decoder(
-        self,
-        prev_output_tokens,
-        encoder_out=None,
-        incremental_state=None,
-        features_only=False,
-        **extra_args,
-    ):
-        attn_args = {'alignment_layer': self.alignment_layer, 'alignment_heads': self.alignment_heads}
-        decoder_out = self.decoder(
-            prev_output_tokens,
-            encoder_out,
-            **attn_args,
-            **extra_args,
-        )
-
-        if self.full_context_alignment:
-            attn_args['full_context_alignment'] = self.full_context_alignment
-            _, alignment_out = self.decoder(
-                prev_output_tokens, encoder_out, features_only=True, **attn_args, **extra_args,
-            )
-            decoder_out[1]['attn'] = alignment_out['attn']
-
-        return decoder_out
-
+    return args
 
 class TransformerEncoder(FairseqEncoder):
     """
@@ -315,7 +290,12 @@ class TransformerEncoder(FairseqEncoder):
             self.layer_norm = LayerNorm(embed_dim)
         else:
             self.layer_norm = None
+        def freeze_module_params(self):
+            if self is not None:
+                for p in self.parameters():
+                    p.requires_grad = False
 
+        freeze_module_params(self)
 
     def forward_embedding(self, src_tokens):
         # embed tokens and positions
@@ -333,7 +313,7 @@ class TransformerEncoder(FairseqEncoder):
             src_lengths (torch.LongTensor): lengths of each source sentence of
                 shape `(batch)`
             return_all_hiddens (bool, optional): also return all of the
-                intermediate hidden states (default: False).
+                intermediate hidden states (default: False)
 
         Returns:
             dict:
@@ -347,7 +327,6 @@ class TransformerEncoder(FairseqEncoder):
         """
         if self.layer_wise_attention:
             return_all_hiddens = True
-
         x, encoder_embedding = self.forward_embedding(src_tokens)
 
         # B x T x C -> T x B x C
@@ -373,7 +352,8 @@ class TransformerEncoder(FairseqEncoder):
             x = self.layer_norm(x)
             if return_all_hiddens:
                 encoder_states[-1] = x
-
+        # print(encoder_padding_mask)
+        # exit()
         return {
             'encoder_out': x,  # T x B x C
             'encoder_padding_mask': encoder_padding_mask,  # B x T
@@ -436,7 +416,6 @@ class TransformerEncoder(FairseqEncoder):
             state_dict[version_key] = torch.Tensor([1])
         return state_dict
 
-
 class TransformerDecoder(FairseqIncrementalDecoder):
     """
     Transformer decoder consisting of *args.decoder_layers* layers. Each layer
@@ -453,11 +432,10 @@ class TransformerDecoder(FairseqIncrementalDecoder):
     def __init__(self, args, dictionary, embed_tokens, no_encoder_attn=False):
         super().__init__(dictionary)
         self.register_buffer('version', torch.Tensor([3]))
-
+        self.tgt_dic=dictionary
         self.dropout = args.dropout
         self.decoder_layerdrop = args.decoder_layerdrop
         self.share_input_output_embed = args.share_decoder_input_output_embed
-        self.tgt_dic=dictionary
 
         input_embed_dim = embed_tokens.embedding_dim
         embed_dim = args.decoder_embed_dim
@@ -480,11 +458,15 @@ class TransformerDecoder(FairseqIncrementalDecoder):
         self.layer_wise_attention = getattr(args, 'layer_wise_attention', False)
 
         self.layers = nn.ModuleList([])
+
         self.layers.extend([
-            TransformerDecoderLayer(args, no_encoder_attn)
+            TransformerAudioDecoderLayer(args, no_encoder_attn)
             for _ in range(args.decoder_layers)
         ])
-
+        # self.layers.extend([
+        #     TransformerDecoderLayer(args, no_encoder_attn)
+        #     for _ in range(args.decoder_layers)
+        # ])
         self.adaptive_softmax = None
 
         self.project_out_dim = Linear(embed_dim, self.output_embed_dim, bias=False) \
@@ -513,6 +495,7 @@ class TransformerDecoder(FairseqIncrementalDecoder):
         self,
         prev_output_tokens,
         encoder_out=None,
+        audio_encoder_out=None,
         incremental_state=None,
         features_only=False,
         **extra_args,
@@ -533,17 +516,19 @@ class TransformerDecoder(FairseqIncrementalDecoder):
                 - the decoder's output of shape `(batch, tgt_len, vocab)`
                 - a dictionary with any model-specific outputs
         """
+        # exit()
         x, extra = self.extract_features(
-            prev_output_tokens, encoder_out, incremental_state, **extra_args,
+            prev_output_tokens, encoder_out,audio_encoder_out, incremental_state, **extra_args,
         )
         if not features_only:
             x = self.output_layer(x)
-        return x, extra
+        return x, None
 
     def extract_features(
         self,
         prev_output_tokens,
         encoder_out=None,
+        audio_encoder_out=None,
         incremental_state=None,
         full_context_alignment=False,
         alignment_layer=None,
@@ -603,6 +588,8 @@ class TransformerDecoder(FairseqIncrementalDecoder):
         # decoder layers
         attn = None
         inner_states = [x]
+        # print( encoder_out['encoder_padding_mask'])
+        # exit()
         for idx, layer in enumerate(self.layers):
             encoder_state = None
             if encoder_out is not None:
@@ -610,7 +597,11 @@ class TransformerDecoder(FairseqIncrementalDecoder):
                     encoder_state = encoder_out['encoder_states'][idx]
                 else:
                     encoder_state = encoder_out['encoder_out']
-
+            audio_encoder_state=None
+            if audio_encoder_out is not None:
+                audio_encoder_state = audio_encoder_out['encoder_out']
+                # print(audio_encoder_state.size())
+                audio_encoder_out['encoder_padding_mask']=None
             if incremental_state is None and not full_context_alignment:
                 self_attn_mask = self.buffered_future_mask(x)
             else:
@@ -623,7 +614,9 @@ class TransformerDecoder(FairseqIncrementalDecoder):
                     x,
                     encoder_state,
                     encoder_out['encoder_padding_mask'] if encoder_out is not None else None,
-                    incremental_state,
+                    audio_encoder_state,
+                    audio_encoder_out['encoder_padding_mask'] if audio_encoder_out is not None else None,
+                    incremental_state=incremental_state,
                     self_attn_mask=self_attn_mask,
                     self_attn_padding_mask=self_attn_padding_mask,
                     need_attn=(idx == alignment_layer),
@@ -711,6 +704,378 @@ class TransformerDecoder(FairseqIncrementalDecoder):
         return state_dict
 
 
+DEFAULT_ENC_VGGBLOCK_CONFIG = ((32, 3, 2, 2, False),) * 2
+DEFAULT_ENC_TRANSFORMER_CONFIG = ((256, 4, 1024, True, 0.2, 0.2, 0.2),) * 2
+# 256: embedding dimension
+# 4: number of heads
+# 1024: FFN
+# True: apply layerNorm before (dropout + resiaul) instead of after
+# 0.2 (dropout): dropout after MultiheadAttention and second FC
+# 0.2 (attention_dropout): dropout in MultiheadAttention
+# 0.2 (relu_dropout): dropout after ReLu
+DEFAULT_DEC_TRANSFORMER_CONFIG = ((256, 2, 1024, True, 0.2, 0.2, 0.2),) * 2
+DEFAULT_DEC_CONV_CONFIG = ((256, 3, True),) * 2
+
+class VGGTransformerEncoder(FairseqEncoder):
+    """VGG + Transformer encoder"""
+
+    def __init__(
+            self,
+            input_feat_per_channel,
+            vggblock_config=DEFAULT_ENC_VGGBLOCK_CONFIG,
+            transformer_config=DEFAULT_ENC_TRANSFORMER_CONFIG,
+            encoder_output_dim=512,
+            in_channels=1,
+            transformer_context=None,
+            transformer_sampling=None,
+    ):
+        """constructor for VGGTransformerEncoder
+
+        Args:
+            - input_feat_per_channel: feature dim (not including stacked,
+              just base feature)
+            - in_channel: # input channels (e.g., if stack 8 feature vector
+                together, this is 8)
+            - vggblock_config: configuration of vggblock, see comments on
+                DEFAULT_ENC_VGGBLOCK_CONFIG
+            - transformer_config: configuration of transformer layer, see comments
+                on DEFAULT_ENC_TRANSFORMER_CONFIG
+            - encoder_output_dim: final transformer output embedding dimension
+            - transformer_context: (left, right) if set, self-attention will be focused
+              on (t-left, t+right)
+            - transformer_sampling: an iterable of int, must match with
+              len(transformer_config), transformer_sampling[i] indicates sampling
+              factor for i-th transformer layer, after multihead att and feedfoward
+              part
+        """
+        super().__init__(None)
+
+        self.num_vggblocks = 0
+        if vggblock_config is not None:
+            if not isinstance(vggblock_config, Iterable):
+                raise ValueError("vggblock_config is not iterable")
+            self.num_vggblocks = len(vggblock_config)
+
+        self.conv_layers = nn.ModuleList()
+        self.in_channels = in_channels
+        self.input_dim = input_feat_per_channel
+
+        if vggblock_config is not None:
+            for _, config in enumerate(vggblock_config):
+                (out_channels,conv_kernel_size,pooling_kernel_size,num_conv_layers,layer_norm,) = config
+                self.conv_layers.append(
+                    VGGBlock(in_channels,out_channels,conv_kernel_size,pooling_kernel_size,num_conv_layers,
+                        input_dim=input_feat_per_channel,layer_norm=layer_norm,)
+                )
+                in_channels = out_channels
+                input_feat_per_channel = self.conv_layers[-1].output_dim
+
+        transformer_input_dim = self.infer_conv_output_dim(
+            self.in_channels, self.input_dim
+        )
+        # transformer_input_dim is the output dimension of VGG part
+
+        self.validate_transformer_config(transformer_config)
+        self.transformer_context = self.parse_transformer_context(transformer_context)
+        self.transformer_sampling = self.parse_transformer_sampling(
+            transformer_sampling, len(transformer_config)
+        )
+
+        self.transformer_layers = nn.ModuleList()
+
+        if transformer_input_dim != transformer_config[0][0]:
+            self.transformer_layers.append(Linear(transformer_input_dim, transformer_config[0][0]))
+        self.transformer_layers.append(
+            TransformerEncoderLayer(prepare_transformer_encoder_params(*transformer_config[0]))
+        )
+        for i in range(1, len(transformer_config)):
+            if transformer_config[i - 1][0] != transformer_config[i][0]:
+                self.transformer_layers.append(Linear(transformer_config[i - 1][0], transformer_config[i][0]))
+            self.transformer_layers.append(
+                TransformerEncoderLayer(prepare_transformer_encoder_params(*transformer_config[i])))
+        self.encoder_output_dim = encoder_output_dim
+        self.transformer_layers.extend(
+            [Linear(transformer_config[-1][0], encoder_output_dim),
+                LayerNorm(encoder_output_dim), ]
+        )
+        def freeze_module_params(self):
+            # for n,p in self.named_parameters():
+            #     print(n)
+            #     if n=="transformer_layers.1.fc1.weight":
+            #         print(p)
+            #         exit()
+            if self is not None:
+                for p in self.parameters():
+                    p.requires_grad = False
+
+        freeze_module_params(self)
+        # exit()
+
+    def forward(self, src_tokens, src_lengths, **kwargs):
+        """
+        src_tokens: padded tensor (B, T, C * feat)
+        src_lengths: tensor of original lengths of input utterances (B,)
+        """
+        # for n, p in self.named_parameters():
+        #     print(n)
+        #     print(p)
+        #
+        #     if n == "transformer_layers.0.weight":
+        #         exit()
+        # print(src_tokens)
+        # print(src_tokens.size())
+        # print(src_lengths)
+        bsz, max_seq_len, _ = src_tokens.size()
+        x = src_tokens.view(bsz, max_seq_len, self.in_channels, self.input_dim)
+        x = x.transpose(1, 2).contiguous()
+        # print("x_1")
+        # print(x)
+        # (B, C, T, feat)
+        for layer_idx in range(len(self.conv_layers)):
+            x = self.conv_layers[layer_idx](x)
+            # print("*****")
+            # print(x)
+        bsz, _, output_seq_len, _ = x.size()
+        # (B, C, T, feat) -> (B, T, C, feat) -> (T, B, C, feat) -> (T, B, C * feat)
+        x = x.transpose(1, 2).transpose(0, 1)
+        x = x.contiguous().view(output_seq_len, bsz, -1)
+        # print("x_2")
+        # print(x)
+        # exit()
+        subsampling_factor = int(max_seq_len * 1.0 / output_seq_len + 0.5)
+
+        # print("subsampling........")
+        # print(output_seq_len)
+        # print(max_seq_len)
+        # print(subsampling_factor)
+        # print(src_lengths.float())
+        # TODO: shouldn't subsampling_factor determined in advance ?
+        # print(src_lengths)
+        input_lengths = (src_lengths.float() / subsampling_factor).ceil().long()
+        # print(input_lengths)
+        encoder_padding_mask, _ = lengths_to_encoder_padding_mask(
+            input_lengths, batch_first=True
+        )
+        # print("encoder_padding_mask")
+        # print(encoder_padding_mask)
+        if not encoder_padding_mask.any():
+            encoder_padding_mask = None
+        # encoder_padding_mask = None
+
+        attn_mask = self.lengths_to_attn_mask(input_lengths, subsampling_factor)
+        # print("attn_mask")
+        # print(attn_mask)
+        transformer_layer_idx = 0
+        for layer_idx in range(len(self.transformer_layers)):
+            # print(layer_idx)
+            # print(x)
+            if isinstance(self.transformer_layers[layer_idx], TransformerEncoderLayer):
+                # print("***************")
+                # print(x.size())
+                # if encoder_padding_mask is  not None:
+                #     print(encoder_padding_mask.size())
+                # else:
+                #     print(encoder_padding_mask)
+
+
+                # print(encoder_padding_mask)
+                # print(layer_idx)
+                # print("x")
+                # print(x)
+                # print("encoder_padding_mask")
+                #
+                # print(encoder_padding_mask)
+                # print("attn_mask")
+                #
+                # print(attn_mask)
+                x = self.transformer_layers[layer_idx](
+                    x, encoder_padding_mask, attn_mask)
+                # print("after x")
+                # print(x)
+                if self.transformer_sampling[transformer_layer_idx] != 1:
+                    sampling_factor = self.transformer_sampling[transformer_layer_idx]
+                    x, encoder_padding_mask, attn_mask = self.slice(
+                        x, encoder_padding_mask, attn_mask, sampling_factor)
+                transformer_layer_idx += 1
+
+            else:
+                x = self.transformer_layers[layer_idx](x)
+            # print("encoder out"+str(layer_idx))
+            # print(x)
+        # encoder_padding_maks is a (T x B) tensor, its [t, b] elements indicate
+        # whether encoder_output[t, b] is valid or not (valid=0, invalid=1)
+        # print("encoder out")
+        # print(x)
+        return {
+            "encoder_out": x,  # (T, B, C)
+            "encoder_padding_mask": encoder_padding_mask.t()
+            if encoder_padding_mask is not None
+            else None,
+            # (B, T) --> (T, B)
+        }
+
+    def infer_conv_output_dim(self, in_channels, input_dim):
+        sample_seq_len = 200
+        sample_bsz = 10
+        x = torch.randn(sample_bsz, in_channels, sample_seq_len, input_dim)
+        for i, _ in enumerate(self.conv_layers):
+            x = self.conv_layers[i](x)
+        x = x.transpose(1, 2)
+        mb, seq = x.size()[:2]
+        return x.contiguous().view(mb, seq, -1).size(-1)
+
+    def validate_transformer_config(self, transformer_config):
+        for config in transformer_config:
+            input_dim, num_heads = config[:2]
+            if input_dim % num_heads != 0:
+                msg = (
+                        "ERROR in transformer config {}:".format(config)
+                        + "input dimension {} ".format(input_dim)
+                        + "not dividable by number of heads".format(num_heads)
+                )
+                raise ValueError(msg)
+
+    def parse_transformer_context(self, transformer_context):
+        """
+        transformer_context can be the following:
+        -   None; indicates no context is used, i.e.,
+            transformer can access full context
+        -   a tuple/list of two int; indicates left and right context,
+            any number <0 indicates infinite context
+                * e.g., (5, 6) indicates that for query at x_t, transformer can
+                access [t-5, t+6] (inclusive)
+                * e.g., (-1, 6) indicates that for query at x_t, transformer can
+                access [0, t+6] (inclusive)
+        """
+        if transformer_context is None:
+            return None
+
+        if not isinstance(transformer_context, Iterable):
+            raise ValueError("transformer context must be Iterable if it is not None")
+
+        if len(transformer_context) != 2:
+            raise ValueError("transformer context must have length 2")
+
+        left_context = transformer_context[0]
+        if left_context < 0:
+            left_context = None
+
+        right_context = transformer_context[1]
+        if right_context < 0:
+            right_context = None
+
+        if left_context is None and right_context is None:
+            return None
+
+        return (left_context, right_context)
+
+    def parse_transformer_sampling(self, transformer_sampling, num_layers):
+        """
+        parsing transformer sampling configuration
+        Args:
+            - transformer_sampling, accepted input:
+                * None, indicating no sampling
+                * an Iterable with int (>0) as element
+            - num_layers, expected number of transformer layers, must match with
+              the length of transformer_sampling if it is not None
+        Returns:
+            - A tuple with length num_layers
+        """
+        if transformer_sampling is None:
+            return (1,) * num_layers
+        if not isinstance(transformer_sampling, Iterable):
+            raise ValueError(
+                "transformer_sampling must be an iterable if it is not None"
+            )
+        if len(transformer_sampling) != num_layers:
+            raise ValueError(
+                "transformer_sampling {} does not match with the number "
+                + "of layers {}".format(transformer_sampling, num_layers)
+            )
+        for layer, value in enumerate(transformer_sampling):
+            if not isinstance(value, int):
+                raise ValueError("Invalid value in transformer_sampling: ")
+            if value < 1:
+                raise ValueError(
+                    "{} layer's subsampling is {}.".format(layer, value)
+                    + " This is not allowed! "
+                )
+        return transformer_sampling
+
+    def slice(self, embedding, padding_mask, attn_mask, sampling_factor):
+        """
+        embedding is a (T, B, D) tensor
+        padding_mask is a (B, T) tensor or None
+        attn_mask is a (T, T) tensor or None
+        """
+        embedding = embedding[::sampling_factor, :, :]
+        if padding_mask is not None:
+            padding_mask = padding_mask[:, ::sampling_factor]
+        if attn_mask is not None:
+            attn_mask = attn_mask[::sampling_factor, ::sampling_factor]
+
+        return embedding, padding_mask, attn_mask
+
+    def lengths_to_attn_mask(self, input_lengths, subsampling_factor=1):
+        """
+        create attention mask according to sequence lengths and transformer
+        context
+        Args:
+            - input_lengths: (B, )-shape Int/Long tensor; input_lengths[b] is
+              the length of b-th sequence
+            - subsampling_factor: int
+                * Note that the left_context and right_context is specified in
+                  the input frame-level while input to transformer may already
+                  go through subsampling (e.g., the use of striding in vggblock)
+                  we use subsampling_factor to scale the left/right context
+        Return:
+            - a (T, T) binary tensor or None, where T is max(input_lengths)
+                * if self.transformer_context is None, None
+                * if left_context is None,
+                    * attn_mask[t, t + right_context + 1:] = 1
+                    * others = 0
+                * if right_context is None,
+                    * attn_mask[t, 0:t - left_context] = 1
+                    * others = 0
+                * elsif
+                    * attn_mask[t, t - left_context: t + right_context + 1] = 0
+                    * others = 1
+        """
+        if self.transformer_context is None:
+            return None
+        maxT = torch.max(input_lengths).item()
+        attn_mask = torch.zeros(maxT, maxT)
+
+        left_context = self.transformer_context[0]
+        right_context = self.transformer_context[1]
+        if left_context is not None:
+            left_context = math.ceil(self.transformer_context[0] / subsampling_factor)
+        if right_context is not None:
+            right_context = math.ceil(self.transformer_context[1] / subsampling_factor)
+
+        for t in range(maxT):
+            if left_context is not None:
+                st = 0
+                en = max(st, t - left_context)
+                attn_mask[t, st:en] = 1
+            if right_context is not None:
+                st = t + right_context + 1
+                st = min(st, maxT - 1)
+                attn_mask[t, st:] = 1
+
+        return attn_mask.to(input_lengths.device)
+
+    def reorder_encoder_out(self, encoder_out, new_order):
+        encoder_out["encoder_out"] = encoder_out["encoder_out"].index_select(
+            1, new_order
+        )
+        if encoder_out["encoder_padding_mask"] is not None:
+            encoder_out["encoder_padding_mask"] = encoder_out[
+                "encoder_padding_mask"
+            ].index_select(1, new_order)
+        return encoder_out
+
+
 def Embedding(num_embeddings, embedding_dim, padding_idx):
     m = nn.Embedding(num_embeddings, embedding_dim, padding_idx=padding_idx)
     nn.init.normal_(m.weight, mean=0, std=embedding_dim ** -0.5)
@@ -725,8 +1090,36 @@ def Linear(in_features, out_features, bias=True):
         nn.init.constant_(m.bias, 0.)
     return m
 
+def base_audio(args):
+    args.input_feat_per_channel = getattr(args, "input_feat_per_channel", 40)
+    # args.vggblock_enc_config = getattr(
+    #     args, "vggblock_enc_config", DEFAULT_ENC_VGGBLOCK_CONFIG
+    # )
+    # args.transformer_enc_config = getattr(
+    #     args, "transformer_enc_config", DEFAULT_ENC_TRANSFORMER_CONFIG
+    # )
+    args.enc_output_dim = getattr(args, "enc_output_dim", 512)
+    args.in_channels = getattr(args, "in_channels", 1)
+    args.tgt_embed_dim = getattr(args, "tgt_embed_dim", 128)
+    args.transformer_context = getattr(args, "transformer_context", "None")
 
-@register_model_architecture('transformer', 'transformer')
+def vggtransformer_2(args):
+
+    args.input_feat_per_channel = getattr(args, "input_feat_per_channel", 80)
+    args.vggblock_enc_config = getattr(
+        args, "vggblock_enc_config", "[(64, 3, 2, 2, True), (128, 3, 2, 2, True)]"
+    )
+    args.transformer_enc_config = getattr(
+        args,
+        "transformer_enc_config",
+        "((1024, 16, 4096, True, 0.15, 0.15, 0.15),) * 16",
+    )
+    args.enc_output_dim = getattr(args, "enc_output_dim", 1024)
+    base_audio(args)
+
+
+
+@register_model_architecture('audio_transformer', 'audio_transformer')
 def base_architecture(args):
     args.encoder_embed_path = getattr(args, 'encoder_embed_path', None)
     args.encoder_embed_dim = getattr(args, 'encoder_embed_dim', 512)
@@ -758,9 +1151,10 @@ def base_architecture(args):
 
     args.decoder_output_dim = getattr(args, 'decoder_output_dim', args.decoder_embed_dim)
     args.decoder_input_dim = getattr(args, 'decoder_input_dim', args.decoder_embed_dim)
+    vggtransformer_2(args)
 
 
-@register_model_architecture('transformer', 'transformer_iwslt_de_en')
+@register_model_architecture('audio_transformer', 'audio_transformer_iwslt_de_en')
 def transformer_iwslt_de_en(args):
     args.encoder_embed_dim = getattr(args, 'encoder_embed_dim', 512)
     args.encoder_ffn_embed_dim = getattr(args, 'encoder_ffn_embed_dim', 1024)
@@ -773,13 +1167,13 @@ def transformer_iwslt_de_en(args):
     base_architecture(args)
 
 
-@register_model_architecture('transformer', 'transformer_wmt_en_de')
+@register_model_architecture('audio_transformer', 'audio_transformer_wmt_en_de')
 def transformer_wmt_en_de(args):
     base_architecture(args)
 
 
 # parameters used in the "Attention Is All You Need" paper (Vaswani et al., 2017)
-@register_model_architecture('transformer', 'transformer_vaswani_wmt_en_de_big')
+@register_model_architecture('audio_transformer', 'audio_transformer_vaswani_wmt_en_de_big')
 def transformer_vaswani_wmt_en_de_big(args):
     args.encoder_embed_dim = getattr(args, 'encoder_embed_dim', 1024)
     args.encoder_ffn_embed_dim = getattr(args, 'encoder_ffn_embed_dim', 4096)
@@ -792,37 +1186,38 @@ def transformer_vaswani_wmt_en_de_big(args):
     base_architecture(args)
 
 
-@register_model_architecture('transformer', 'transformer_vaswani_wmt_en_fr_big')
+@register_model_architecture('audio_transformer', 'audio_transformer_vaswani_wmt_en_fr_big')
 def transformer_vaswani_wmt_en_fr_big(args):
     args.dropout = getattr(args, 'dropout', 0.1)
     transformer_vaswani_wmt_en_de_big(args)
 
 
-@register_model_architecture('transformer', 'transformer_wmt_en_de_big')
+@register_model_architecture('audio_transformer', 'audio_transformer_wmt_en_de_big')
 def transformer_wmt_en_de_big(args):
     args.attention_dropout = getattr(args, 'attention_dropout', 0.1)
     transformer_vaswani_wmt_en_de_big(args)
 
 
 # default parameters used in tensor2tensor implementation
-@register_model_architecture('transformer', 'transformer_wmt_en_de_big_t2t')
+@register_model_architecture('audio_transformer', 'audio_transformer_wmt_en_de_big_t2t')
 def transformer_wmt_en_de_big_t2t(args):
     args.encoder_normalize_before = getattr(args, 'encoder_normalize_before', True)
     args.decoder_normalize_before = getattr(args, 'decoder_normalize_before', True)
     args.attention_dropout = getattr(args, 'attention_dropout', 0.1)
     args.activation_dropout = getattr(args, 'activation_dropout', 0.1)
     transformer_vaswani_wmt_en_de_big(args)
-
-@register_model_architecture('transformer_align', 'transformer_align')
-def transformer_align(args):
-    args.alignment_heads = getattr(args, 'alignment_heads', 1)
-    args.alignment_layer = getattr(args, 'alignment_layer', 4)
-    args.full_context_alignment = getattr(args, 'full_context_alignment', False)
-    base_architecture(args)
-
-
-@register_model_architecture('transformer_align', 'transformer_wmt_en_de_big_align')
-def transformer_wmt_en_de_big_align(args):
-    args.alignment_heads = getattr(args, 'alignment_heads', 1)
-    args.alignment_layer = getattr(args, 'alignment_layer', 4)
-    transformer_wmt_en_de_big(args)
+#
+#
+# @register_model_architecture('transformer_align', 'transformer_align')
+# def transformer_align(args):
+#     args.alignment_heads = getattr(args, 'alignment_heads', 1)
+#     args.alignment_layer = getattr(args, 'alignment_layer', 4)
+#     args.full_context_alignment = getattr(args, 'full_context_alignment', False)
+#     base_architecture(args)
+#
+#
+# @register_model_architecture('transformer_align', 'transformer_wmt_en_de_big_align')
+# def transformer_wmt_en_de_big_align(args):
+#     args.alignment_heads = getattr(args, 'alignment_heads', 1)
+#     args.alignment_layer = getattr(args, 'alignment_layer', 4)
+#     transformer_wmt_en_de_big(args)

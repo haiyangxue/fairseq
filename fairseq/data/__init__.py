@@ -43,6 +43,7 @@ from .transform_eos_dataset import TransformEosDataset
 from .transform_eos_lang_pair_dataset import TransformEosLangPairDataset
 from .truncate_dataset import TruncateDataset
 from .resampling_dataset import ResamplingDataset
+from .audio.audio_language_pair_dataset import AudioLanguagePairDataset
 
 from .iterators import (
     CountingIterator,
@@ -98,4 +99,5 @@ __all__ = [
     'TransformEosLangPairDataset',
     'TruncateDataset',
     'TruncatedDictionary',
+    'AudioLanguagePairDataset',
 ]

@@ -121,13 +121,62 @@ class Trainer(object):
         return self._lr_scheduler
 
     def _build_optimizer(self):
-        params = list(
-            filter(
-                lambda p: p.requires_grad,
-                chain(self.model.parameters(), self.criterion.parameters()),
-            )
-        )
+        self.index = 0
+        self.index2 = 0
+        # params = list(
+        #     filter(
+        #         lambda p: p.requires_grad,
+        #         chain(self.model.parameters(), self.criterion.parameters()),
+        #     )
+        # )
+        # for n, p in chain(self.model.named_parameters(), self.criterion.named_parameters()):
+        #     print(n)
+        # exit()
 
+        if self.args.task=="audio_translation":
+            params = list(
+                filter(
+                    lambda p: p.requires_grad,
+                    chain(self.model.parameters(), self.criterion.parameters()),
+                ))
+            # def filter_fn(n, p):
+            #     self.index += 1
+            #     if not p.requires_grad:
+            #         print(n)
+            #     return p.requires_grad
+            #     # print(n)
+            #     # cond = p.requires_grad
+            #     # # if self.args.fix_transformer:
+            #     # # cond &= ('audio_encoder.conv_layers' not in n and 'audio_encoder.transformer_layers' not in n and  'text_encoder' not in n)
+            #     # cond &= ('audio_encoder.conv_layers' not in n and 'audio_encoder.transformer_layers' not in n )
+            #
+            #     # if not cond:
+            #     #     self.index2 += 1
+            #     #     p.requires_grad=False
+            #     # else:
+            #     #     print(n)
+            #     # return  cond
+            # params = [p for n, p in chain(self.model.named_parameters(), self.criterion.named_parameters()) if filter_fn(n, p)]
+            # exit()
+        else:
+            params = list(
+                filter(
+                    lambda p: p.requires_grad,
+                    chain(self.model.parameters(), self.criterion.parameters()),
+                )
+            )
+        # print(self.index)
+        # print(self.index2)
+        # print(len(params))
+        # exit()
+        # # print(len(params))
+        # index=0
+        # for n, p in chain(self.model.named_parameters(), self.criterion.named_parameters()):
+        #     index+=1
+        #     # print('{}: {}'.format(p.data[0], n))
+        #     print(str(index)+" "+n)
+        #     print(p.requires_grad)
+        # exit()
         if self.args.fp16:
             if self.cuda and torch.cuda.get_device_capability(0)[0] < 7:
                 print('| WARNING: your device does NOT support faster training with --fp16, '
@@ -139,6 +188,7 @@ class Trainer(object):
         else:
             if self.cuda and torch.cuda.get_device_capability(0)[0] >= 7:
                 print('| NOTICE: your device may support faster training with --fp16')
+
             self._optimizer = optim.build_optimizer(self.args, params)
 
         if self.args.use_bmuf:
@@ -168,6 +218,20 @@ class Trainer(object):
         reset_meters=False,
     ):
         """Load all training state from a checkpoint file."""
+        def rename_state_dict_keys(source,old_name,new_name,all=True):
+            new_state_dict = OrderedDict()
+
+            for key, value in source.items():
+                if all:
+                    if "encoder" in key and "decoder" not in key:
+                        key = key.replace(old_name,new_name)
+                    new_state_dict[key] = value
+                else:
+                    if "encoder" in key and "decoder" not in key:
+                        key = key.replace(old_name,new_name)
+                        new_state_dict[key] = value
+            return new_state_dict
+
         extra_state, self._optim_history, last_optim_state = None, [], None
 
         try:
@@ -181,7 +245,13 @@ class Trainer(object):
 
             # load model parameters
             try:
+                # if self.args.task == "audio_translation" and self.args.audio_pt is not None:
+                #     # print("**************")
+                #     # state['model']=rename_state_dict_keys(state['model'],"encoder","text_encoder")
+                #     self.get_model().load_state_dict(state['model'], strict=False, args=self.args)
+                # else:
                 self.get_model().load_state_dict(state['model'], strict=True, args=self.args)
+
                 if utils.has_parameters(self.get_criterion()):
                     self.get_criterion().load_state_dict(state['criterion'], strict=True)
             except Exception:
@@ -189,10 +259,10 @@ class Trainer(object):
                     'Cannot load model parameters from checkpoint {}; '
                     'please ensure that the architectures match.'.format(filename)
                 )
-
             extra_state = state['extra_state']
             self._optim_history = state['optimizer_history']
             last_optim_state = state.get('last_optimizer_state', None)
+
 
         if last_optim_state is not None and not reset_optimizer:
             # rebuild optimizer after loading model, since params may have changed
@@ -213,7 +283,7 @@ class Trainer(object):
 
         if extra_state is not None:
             epoch = extra_state['train_iterator']['epoch']
-            print('| loaded checkpoint {} (epoch {} @ {} updates)'.format(
+            print('| loaded mt checkpoint {} (epoch {} @ {} updates)'.format(
                 filename, epoch, self.get_num_updates()))
 
             self.lr_step(epoch)
@@ -228,7 +298,16 @@ class Trainer(object):
                         meter.reset()
         else:
             print('| no existing checkpoint found {}'.format(filename))
-
+        if self.args.task == "audio_translation" and self.args.audio_pt is not None:
+            print('| loaded audio checkpoint {} '.format(self.args.audio_pt))
+            model_dict = torch.load(self.args.audio_pt)
+            model_dict["model"] = rename_state_dict_keys(model_dict["model"], "encoder", "audio_encoder", all=False)
+            self.model.load_state_dict(model_dict["model"], strict=False)
+        if self.args.task == "audio_translation" and self.args.mt_pt is not None:
+            print('| loaded mt checkpoint {} '.format(self.args.mt_pt))
+            model_dict = torch.load(self.args.mt_pt)
+            # model_dict["model"] = rename_state_dict_keys(model_dict["model"], "encoder", "audio_encoder", all=False)
+            self.model.load_state_dict(model_dict["model"], strict=False)
         return extra_state
 
     def get_train_iterator(self, epoch, combine=True, load_dataset=True, data_selector=None):

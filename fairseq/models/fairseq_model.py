@@ -16,7 +16,8 @@ from fairseq import utils
 from fairseq.checkpoint_utils import prune_state_dict
 from fairseq.data import Dictionary
 from fairseq.models import FairseqDecoder, FairseqEncoder
-
+from . import SimNoise
+import numpy
 
 class BaseFairseqModel(nn.Module):
     """Base class for fairseq models."""
@@ -194,6 +195,10 @@ class FairseqEncoderDecoderModel(BaseFairseqModel):
 
         self.encoder = encoder
         self.decoder = decoder
+        if hasattr(encoder, 'src_dic'):
+            self.src_dic = encoder.src_dic
+        if hasattr(decoder, 'tgt_dic'):
+            self.tgt_dic = decoder.tgt_dic
         assert isinstance(self.encoder, FairseqEncoder)
         assert isinstance(self.decoder, FairseqDecoder)
 
@@ -220,6 +225,15 @@ class FairseqEncoderDecoderModel(BaseFairseqModel):
                 - the decoder's output of shape `(batch, tgt_len, vocab)`
                 - a dictionary with any model-specific outputs
         """
+        # if hasattr(self.encoder, 'src_dic'):
+        #     print_ = numpy.random.randint(1, 5)
+        #     if print_ == 2:
+        #         for item1, item2 in zip(self.src_dic.string(src_tokens).split("\n"),
+        #                                 self.tgt_dic.string(prev_output_tokens).split("\n")):
+        #             print()
+        #             print("src--- " + item1)
+        #             print("tgt--- " + item2)
+        #         print("*******************************************************************")
         encoder_out = self.encoder(src_tokens, src_lengths=src_lengths, **kwargs)
         decoder_out = self.decoder(prev_output_tokens, encoder_out=encoder_out, **kwargs)
         return decoder_out
@@ -252,7 +266,131 @@ class FairseqEncoderDecoderModel(BaseFairseqModel):
         """Maximum length supported by the decoder."""
         return self.decoder.max_positions()
 
+class AudioEncoderDecoderModel(BaseFairseqModel):
+    """Base class for encoder-decoder models.
 
+    Args:
+        encoder (FairseqEncoder): the encoder
+        decoder (FairseqDecoder): the decoder
+    """
+
+    def __init__(self, encoder,audio_encoder, decoder):
+        super().__init__()
+
+        self.encoder = encoder
+        self.audio_encoder = audio_encoder
+        self.src_dic = encoder.src_dic
+        self.decoder = decoder
+        self.tgt_dic = decoder.tgt_dic
+        self.list_char=list(range(6,800))
+        # self.list_char=[3,3,3]
+
+        assert isinstance(self.encoder, FairseqEncoder)
+        assert isinstance(self.decoder, FairseqDecoder)
+
+    def forward(self, src_tokens, src_lengths, audio, audio_lengths, prev_output_tokens, **kwargs):
+        """
+        Run the forward pass for an encoder-decoder model.
+
+        First feed a batch of source tokens through the encoder. Then, feed the
+        encoder output and previous decoder outputs (i.e., teacher forcing) to
+        the decoder to produce the next outputs::
+
+            encoder_out = self.encoder(src_tokens, src_lengths)
+            return self.decoder(prev_output_tokens, encoder_out)
+
+        Args:
+            src_tokens (LongTensor): tokens in the source language of shape
+                `(batch, src_len)`
+            src_lengths (LongTensor): source sentence lengths of shape `(batch)`
+            prev_output_tokens (LongTensor): previous decoder outputs of shape
+                `(batch, tgt_len)`, for teacher forcing
+
+        Returns:
+            tuple:
+                - the decoder's output of shape `(batch, tgt_len, vocab)`
+                - a dictionary with any model-specific outputs
+        """
+        # for p in self.audio_encoder.parameters():
+        #     print(p.requires_grad)
+        # print(src_tokens.size())
+        # print(self.src_dic.string(src_tokens))
+        print_ = numpy.random.randint(0, 3)
+        # print(print_)
+
+        if print_ == 0:
+            src_tokens = SimNoise.replace(src_tokens, insert_chars=self.list_char,symbol_drop=0.2)
+        elif print_ == 1:
+            src_tokens = SimNoise.replace(src_tokens, insert_chars=[3, 3, 3], symbol_drop=0.2)
+        else:
+            src_tokens = SimNoise.drop_word_pad(src_tokens, symbol_drop=0.2)
+
+        # for item1, item2 in zip(self.src_dic.string(src_tokens).split("\n"),
+        #                             self.tgt_dic.string(prev_output_tokens).split("\n")):
+        #         print("src--- " + item1)
+        #         print("tgt--- " + item2)
+        # print_ = numpy.random.randint(1, 5)
+        # if print_==2:
+        #     for item1, item2 in zip(self.src_dic.string(src_tokens).split("\n"),
+        #                             self.tgt_dic.string(prev_output_tokens).split("\n")):
+        #         print()
+        #         print("src--- " + item1)
+        #         print("tgt--- " + item2)
+        # print(self.src_dic.string(src_tokens))
+        # print(self.tgt_dic.string(prev_output_tokens))
+        # print(src_tokens.size())
+        # print(prev_output_tokens.size())
+        # exit()
+        encoder_out = self.encoder(src_tokens, src_lengths=src_lengths, **kwargs)
+        # audio_encoder_out=None
+
+        audio_encoder_out = self.audio_encoder(audio, audio_lengths)
+        # audio_encoder_out=None
+        # print(audio_encoder_out)
+        # exit()
+        # print()
+        # print("****************")
+        # print(encoder_out)
+        # print(audio.size())
+        # print(audio_encoder_out['encoder_out'].size())
+        # print()
+        # print(encoder_out['encoder_padding_mask'])
+        # print(audio_encoder_out['encoder_padding_mask'])
+        # print(encoder_out['encoder_out'].size())
+        # exit()
+        # print(encoder_out)
+        # decoder_out = self.decoder(prev_output_tokens, encoder_out=encoder_out, **kwargs)
+        decoder_out = self.decoder(prev_output_tokens, encoder_out=encoder_out,audio_encoder_out=audio_encoder_out, **kwargs)
+        return decoder_out
+
+    def forward_decoder(self, prev_output_tokens, **kwargs):
+
+        return self.decoder(prev_output_tokens, **kwargs)
+
+    def extract_features(self, src_tokens, src_lengths, prev_output_tokens, **kwargs):
+        """
+        Similar to *forward* but only return features.
+
+        Returns:
+            tuple:
+                - the decoder's features of shape `(batch, tgt_len, embed_dim)`
+                - a dictionary with any model-specific outputs
+        """
+        encoder_out = self.encoder(src_tokens, src_lengths=src_lengths, **kwargs)
+        features = self.decoder.extract_features(prev_output_tokens, encoder_out=encoder_out, **kwargs)
+        return features
+
+    def output_layer(self, features, **kwargs):
+        """Project features to the default output size (typically vocabulary size)."""
+        return self.decoder.output_layer(features, **kwargs)
+
+    def max_positions(self):
+        """Maximum length supported by the model."""
+        return (self.encoder.max_positions(), self.decoder.max_positions())
+
+    def max_decoder_positions(self):
+        """Maximum length supported by the decoder."""
+        return self.decoder.max_positions()
 class FairseqModel(FairseqEncoderDecoderModel):
 
     def __init__(self, *args, **kwargs):

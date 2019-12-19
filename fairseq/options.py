@@ -380,6 +380,8 @@ def add_checkpoint_args(parser):
     group.add_argument('--restore-file', default='checkpoint_last.pt',
                        help='filename from which to load checkpoint '
                             '(default: <save-dir>/checkpoint_last.pt')
+    group.add_argument('--audio-pt',help='filename from which audio pt to load checkpoint ')
+    group.add_argument('--mt-pt', help='filename from which mt pt to load checkpoint ')
     group.add_argument('--reset-dataloader', action='store_true',
                        help='if set, does not reload dataloader state from the checkpoint')
     group.add_argument('--reset-lr-scheduler', action='store_true',

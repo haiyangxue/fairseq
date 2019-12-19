@@ -26,7 +26,7 @@ from .sinusoidal_positional_embedding import SinusoidalPositionalEmbedding
 from .transformer_sentence_encoder_layer import TransformerSentenceEncoderLayer
 from .transformer_sentence_encoder import TransformerSentenceEncoder
 from .unfold import unfold1d
-from .transformer_layer import TransformerDecoderLayer, TransformerEncoderLayer
+from .transformer_layer import TransformerDecoderLayer, TransformerEncoderLayer,TransformerAudioDecoderLayer
 from .vggblock import VGGBlock
 
 __all__ = [
@@ -59,4 +59,5 @@ __all__ = [
     'TransformerEncoderLayer',
     'VGGBlock',
     'unfold1d',
+    'TransformerAudioDecoderLayer',
 ]
