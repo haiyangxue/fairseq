@@ -27,7 +27,6 @@ def main(args):
     print(args)
 
     use_cuda = torch.cuda.is_available() and not args.cpu
-
     # Load dataset splits
     task = tasks.setup_task(args)
     task.load_dataset(args.gen_subset)
