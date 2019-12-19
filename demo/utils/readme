@@ -1,0 +1,8 @@
+pt2npz.py 需要pytorch环境
+'usage: %s + pt_path + save_npz_path + para_name_json '
+
+npz2ckpt 需要TensorFlow环境
+'usage: %s + original_t2t_model_path + npz_model_path + output_t2t_model_path'
+
+para_name.json
+T2T与Fairseq的参数名称对应
